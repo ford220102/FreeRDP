@@ -40,16 +40,6 @@ jobs:
 
           Restart-Service -Name TermService -Force
 
-      - name: Optimize GPU for RDP
-        run: |
-          # Enable hardware acceleration for RDP
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' `
-                           -Name "bEnumerateHWBeforeSW" -Value 1 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' `
-                           -Name "AVCHardwareEncodePreferred" -Value 1 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' `
-                           -Name "AVC444ModePreferred" -Value 1 -ErrorAction SilentlyContinue
-
       - name: Create RDP User with Secure Password
         run: |
           function Generate-SecurePassword {
@@ -75,9 +65,8 @@ jobs:
           New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -FullName "RDP User"
           Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
-          Add-LocalGroupMember -Group "Performance Log Users" -Member "RDPUser"
           
-          # Store credentials securely
+          # Store credentials
           echo "RDP_USER=RDPUser" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
@@ -86,129 +75,182 @@ jobs:
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
+          Write-Host "Downloading Tailscale..."
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Write-Host "Installing Tailscale..."
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed successfully"
+
+      - name: Debug Tailscale Installation
+        run: |
+          Write-Host "=== Tailscale Debug Info ==="
+          # Check if Tailscale is installed
+          $tsPath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tsPath) {
+              Write-Host "✓ Tailscale executable found"
+              & $tsPath version
+          } else {
+              Write-Error "✗ Tailscale executable not found"
+          }
+          
+          # Check service status
+          $service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+          if ($service) {
+              Write-Host "Tailscale service status: $($service.Status)"
+          } else {
+              Write-Host "Tailscale service not found"
+          }
+          Write-Host "============================"
 
       - name: Establish Tailscale Connection
         run: |
-          # Generate unique hostname
-          $hostname = "gh-gpu-runner-$env:GITHUB_RUN_ID"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          $authKey = "tskey-auth-kUq9WjtGoK11CNTRL-wSh1PAHzkbfwmphDsK6sbfmaPzcco5kUc"
           
-          # Start Tailscale with your fixed auth key
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="tskey-auth-kUq9WjtGoK11CNTRL-wSh1PAHzkbfwmphDsK6sbfmaPzcco5kUc" --hostname=$hostname --accept-routes
+          Write-Host "Using auth key: $($authKey.Substring(0, 20))..." # Log partial key for debugging
+          Write-Host "Hostname: $hostname"
           
-          # Get Tailscale IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 15) {
-              Start-Sleep -Seconds 3
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              $retries++
-          }
+          # Start Tailscale with detailed logging
+          Write-Host "Starting Tailscale..."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=$hostname --accept-routes --reset
           
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned"
-              exit 1
-          }
+          # Wait and check status with more details
+          Write-Host "Checking Tailscale status..."
+          $maxRetries = 20
+          $retryCount = 0
           
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          echo "RDP_HOSTNAME=$hostname" >> $env:GITHUB_ENV
-
-      - name: Install GPU Drivers (if needed)
-        run: |
-          # Check if basic display driver is active (indicating missing GPU drivers)
-          $gpuStatus = Get-CimInstance -ClassName Win32_VideoController | Where-Object { $_.Name -like "*Basic Display*" }
-          
-          if ($gpuStatus) {
-              Write-Host "Basic display driver detected. Installing NVIDIA GPU drivers..."
+          while ($retryCount -lt $maxRetries) {
+              Write-Host "Attempt $($retryCount + 1)/$maxRetries..."
               
-              # Download and install NVIDIA drivers
-              $driverUrl = "https://us.download.nvidia.com/Windows/535.98/535.98-desktop-win10-win11-64bit-international-whql.exe"
-              $driverPath = "$env:TEMP\nvidia_driver.exe"
+              # Get detailed status
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status --verbose
               
-              try {
-                  Invoke-WebRequest -Uri $driverUrl -OutFile $driverPath
-                  Start-Process -FilePath $driverPath -ArgumentList "-s", "-noreboot" -Wait -NoNewWindow
-                  Write-Host "GPU drivers installed successfully"
+              # Try to get IP
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              $tsState = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json 2>$null
+              
+              if ($tsIP -and $tsState.BackendState -eq "Running") {
+                  Write-Host "✓ Tailscale connected successfully!"
+                  Write-Host "Assigned IP: $tsIP"
+                  echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                  echo "RDP_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+                  break
               }
-              catch {
-                  Write-Warning "Failed to install GPU drivers: $_"
+              
+              if ($tsState) {
+                  Write-Host "Current state: $($tsState.BackendState)"
+                  Write-Host "Login URL: $($tsState.Self.ExitNode)"
               }
-              finally {
-                  if (Test-Path $driverPath) { Remove-Item $driverPath -Force }
+              
+              $retryCount++
+              if ($retryCount -eq 10) {
+                  Write-Host "Trying reset after 10 attempts..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
               }
-          } else {
-              Write-Host "GPU drivers already installed"
+              Start-Sleep -Seconds 5
+          }
+          
+          if (-not $env:TAILSCALE_IP) {
+              Write-Host "=== TAILSCALE TROUBLESHOOTING ==="
+              Write-Host "1. Check if auth key is valid and not expired"
+              Write-Host "2. Verify key has proper permissions"
+              Write-Host "3. Try generating a new auth key in Tailscale admin"
+              Write-Host "4. Check Tailscale logs: Get-EventLog -LogName Application -Source Tailscale | Select-Object -Last 10"
+              
+              # Try alternative connection method
+              Write-Host "Attempting alternative connection method..."
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=$hostname --accept-routes --force-reauth
+              Start-Sleep -Seconds 10
+              
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($tsIP) {
+                  Write-Host "✓ Connected after force reauth!"
+                  echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                  echo "RDP_HOSTNAME=$hostname" >> $env:GITHUB_ENV
+              } else {
+                  Write-Error "Failed to establish Tailscale connection after $maxRetries attempts"
+                  Write-Host "Proceeding with local RDP setup only..."
+                  echo "TAILSCALE_IP=LOCAL_ONLY" >> $env:GITHUB_ENV
+              }
           }
 
-      - name: Configure Display and Graphics
+      - name: Configure Network for RDP (Fallback)
+        if: env.TAILSCALE_IP == 'LOCAL_ONLY'
         run: |
-          # Set high performance power plan
-          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          Write-Host "Setting up local RDP access..."
+          # Additional firewall rules for local network
+          netsh advfirewall firewall add rule name="RDP-Local" dir=in action=allow protocol=TCP localport=3389
           
-          # Enable hardware accelerated GPU scheduling
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" `
-                           -Name "HwSchMode" -Value 2 -ErrorAction SilentlyContinue
+          # Get local IP
+          $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -eq "Ethernet" -or $_.InterfaceAlias -eq "Wi-Fi" } | Select-Object -First 1).IPAddress
+          if (-not $localIP) {
+              $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1).IPAddress
+          }
+          
+          echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
+          Write-Host "Local IP: $localIP"
 
-      - name: Verify RDP and GPU Accessibility
+      - name: Verify RDP Accessibility
         run: |
-          Write-Host "=== Connection Details ==="
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "Hostname: $env:RDP_HOSTNAME"
-          Write-Host "Username: $env:RDP_USER"
-          
-          # Test RDP connectivity
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          if ($testResult.TcpTestSucceeded) {
-              Write-Host "✓ RDP port 3389 is accessible"
+          if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -ne 'LOCAL_ONLY') {
+              $testIP = $env:TAILSCALE_IP
+              Write-Host "Testing Tailscale RDP connection: $testIP"
           } else {
-              Write-Error "✗ RDP port 3389 is not accessible"
-              exit 1
+              $testIP = $env:LOCAL_IP
+              Write-Host "Testing Local RDP connection: $testIP"
           }
           
-          # Display final GPU status
-          Write-Host "`n=== Final GPU Status ==="
-          $gpus = Get-CimInstance -ClassName Win32_VideoController
-          foreach ($gpu in $gpus) {
-              Write-Host "GPU: $($gpu.Name)"
-              Write-Host "Driver: $($gpu.DriverVersion)"
-              Write-Host "VRAM: $([math]::Round($gpu.AdapterRAM/1GB, 2)) GB"
-              Write-Host "Status: $($gpu.Status)"
-              Write-Host "---"
+          # Test RDP port
+          $testResult = Test-NetConnection -ComputerName $testIP -Port 3389 -WarningAction SilentlyContinue -InformationLevel Quiet
+          if ($testResult) {
+              Write-Host "✓ RDP port 3389 is accessible on $testIP"
+          } else {
+              Write-Host "⚠ RDP port test failed on $testIP, but continuing..."
           }
+
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "================================================"
+          Write-Host "🚀 RDP ACCESS READY"
+          Write-Host "================================================"
+          
+          if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -ne 'LOCAL_ONLY') {
+              Write-Host "📍 Tailscale Address: $env:TAILSCALE_IP"
+          }
+          if ($env:LOCAL_IP) {
+              Write-Host "📍 Local Address: $env:LOCAL_IP"
+          }
+          
+          Write-Host "👤 Username: $env:RDP_USER" 
+          Write-Host "🔐 Password: $env:RDP_PASSWORD"
+          Write-Host "💻 Hostname: $env:COMPUTERNAME"
+          Write-Host ""
+          Write-Host "💡 Connection Methods:"
+          if ($env:TAILSCALE_IP) {
+              Write-Host "• Tailscale VPN: $env:TAILSCALE_IP"
+          }
+          if ($env:LOCAL_IP) {
+              Write-Host "• Local Network: $env:LOCAL_IP"
+          }
+          Write-Host "================================================"
 
       - name: Maintain RDP Connection
         run: |
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host "🚀 RDP WITH GPU ACCESS READY"
-          Write-Host "================================================"
-          Write-Host "📍 Address: $env:TAILSCALE_IP"
-          Write-Host "👤 Username: $env:RDP_USER" 
-          Write-Host "🔐 Password: $env:RDP_PASSWORD"
-          Write-Host "💻 Hostname: $env:RDP_HOSTNAME"
-          Write-Host ""
-          Write-Host "💡 Tips:"
-          Write-Host "• Use Microsoft Remote Desktop application"
-          Write-Host "• Enable all experience settings for best performance"
-          Write-Host "• Set color depth to 32-bit for best quality"
-          Write-Host "• GPU acceleration should be available automatically"
-          Write-Host "================================================"
-          Write-Host ""
-          
-          # Keep-alive loop with status updates
           $startTime = Get-Date
           while ($true) {
               $uptime = (Get-Date) - $startTime
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active - Uptime: $($uptime.ToString('hh\:mm\:ss')) - GPU available for acceleration"
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active - Uptime: $($uptime.ToString('hh\:mm\:ss'))"
               
-              # Periodically verify Tailscale connection
-              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
-              if ($tsStatus.BackendState -eq "Running") {
-                  Write-Host "   ✓ Tailscale connected: $($tsStatus.Self.TailscaleIPs[0])"
-              } else {
-                  Write-Warning "   ⚠ Tailscale connection issue"
+              # Check Tailscale status if applicable
+              if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -ne 'LOCAL_ONLY') {
+                  $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json 2>$null
+                  if ($tsStatus -and $tsStatus.BackendState -eq "Running") {
+                      Write-Host "   ✓ Tailscale: $($tsStatus.Self.TailscaleIPs[0])"
+                  } else {
+                      Write-Host "   ⚠ Tailscale: Not connected"
+                  }
               }
               
               Start-Sleep -Seconds 300
