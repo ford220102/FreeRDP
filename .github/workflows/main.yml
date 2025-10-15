@@ -95,8 +95,8 @@ jobs:
           # Generate unique hostname
           $hostname = "gh-gpu-runner-$env:GITHUB_RUN_ID"
           
-          # Start Tailscale
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --accept-routes
+          # Start Tailscale with your fixed auth key
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="tskey-auth-kUq9WjtGoK11CNTRL-wSh1PAHzkbfwmphDsK6sbfmaPzcco5kUc" --hostname=$hostname --accept-routes
           
           # Get Tailscale IP
           $tsIP = $null
@@ -123,7 +123,7 @@ jobs:
           if ($gpuStatus) {
               Write-Host "Basic display driver detected. Installing NVIDIA GPU drivers..."
               
-              # Download and install NVIDIA drivers (example - adjust URL as needed)
+              # Download and install NVIDIA drivers
               $driverUrl = "https://us.download.nvidia.com/Windows/535.98/535.98-desktop-win10-win11-64bit-international-whql.exe"
               $driverPath = "$env:TEMP\nvidia_driver.exe"
               
